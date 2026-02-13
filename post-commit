@@ -1,0 +1,91 @@
+#!/bin/sh
+# Global post-commit hook: short-term memory state snapshot
+# Install: git config --global core.hooksPath ~/.git-hooks
+#
+# After each commit, invokes claude CLI to write a compressed
+# state snapshot to .claude/shortterm.log. This gives future
+# sessions context recovery without re-reading entire files.
+
+STATE_DIR=".claude"
+STATE_FILE="$STATE_DIR/shortterm.log"
+CODEBOOK_FILE="$STATE_DIR/codebook.json"
+MAX_ENTRIES=5
+
+# Only run if claude CLI is available
+if ! command -v claude >/dev/null 2>&1; then
+    exit 0
+fi
+
+# Create .claude dir if it doesn't exist
+mkdir -p "$STATE_DIR"
+
+# Initialize codebook if missing
+if [ ! -f "$CODEBOOK_FILE" ]; then
+    echo '{}' > "$CODEBOOK_FILE"
+fi
+
+# Get last commit info
+COMMIT_MSG=$(git log -1 --pretty=%s)
+COMMIT_FILES=$(git diff-tree --no-commit-id --name-only -r HEAD | head -20)
+PROJECT_NAME=$(basename "$(pwd)")
+TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+# Invoke claude CLI with a tight, focused prompt
+# This runs in its own context window — doesn't pollute the main session
+claude --print --max-turns 1 "You are writing a state snapshot for short-term memory recovery.
+
+Project: $PROJECT_NAME
+Last commit: $COMMIT_MSG
+Files changed:
+$COMMIT_FILES
+
+Codebook (use these abbreviations, add new ones if a term has appeared 3+ times):
+$(cat "$CODEBOOK_FILE")
+
+Existing log (for codebook frequency analysis):
+$(cat "$STATE_FILE" 2>/dev/null || echo "empty")
+
+TASKS:
+1. Write ONE line in this exact pipe-delimited format:
+   timestamp|project|files-changed|task-summary|decisions|next-steps
+   Use codebook abbreviations where they exist. Keep the ENTIRE line under 200 chars.
+
+2. If any term appears 3+ times across the log, add it to the codebook as a short abbreviation.
+
+OUTPUT FORMAT — output ONLY these two blocks, nothing else:
+
+STATE:
+(the single snapshot line)
+
+CODEBOOK:
+(the full updated codebook JSON, or UNCHANGED if no updates needed)" > /tmp/claude-stm-output.txt 2>/dev/null
+
+# Parse output and update files
+if [ -f /tmp/claude-stm-output.txt ]; then
+    # Extract state line
+    STATE_LINE=$(sed -n '/^STATE:$/,/^$/p' /tmp/claude-stm-output.txt | grep -v '^STATE:$' | head -1)
+
+    # Extract codebook
+    CODEBOOK_UPDATE=$(sed -n '/^CODEBOOK:$/,/^$/p' /tmp/claude-stm-output.txt | grep -v '^CODEBOOK:$' | head -1)
+
+    # Append state line if we got one
+    if [ -n "$STATE_LINE" ]; then
+        echo "$STATE_LINE" >> "$STATE_FILE"
+
+        # Trim to last N entries
+        TOTAL=$(wc -l < "$STATE_FILE")
+        if [ "$TOTAL" -gt "$MAX_ENTRIES" ]; then
+            tail -n "$MAX_ENTRIES" "$STATE_FILE" > "$STATE_FILE.tmp"
+            mv "$STATE_FILE.tmp" "$STATE_FILE"
+        fi
+    fi
+
+    # Update codebook if changed
+    if [ -n "$CODEBOOK_UPDATE" ] && [ "$CODEBOOK_UPDATE" != "UNCHANGED" ]; then
+        echo "$CODEBOOK_UPDATE" > "$CODEBOOK_FILE"
+    fi
+
+    rm -f /tmp/claude-stm-output.txt
+fi
+
+exit 0
