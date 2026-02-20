@@ -1,0 +1,1 @@
+2026-02-13|knightsrook-cortex|post-commit|rm LFS hooks, unset CLAUDECODE for nested session fix|env var cleanup|none
